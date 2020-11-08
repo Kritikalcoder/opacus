@@ -17,11 +17,13 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
+import torchcsprng as prng
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from opacus import PrivacyEngine, autograd_grad_sample
+from opacus import PrivacyEngine
 from opacus.utils.module_modification import convert_batchnorm_modules
+from tqdm import tqdm
 
 
 parser = argparse.ArgumentParser()
@@ -74,6 +76,12 @@ parser.add_argument(
     help="Disable privacy training and just train with vanilla SGD",
 )
 parser.add_argument(
+    "--secure-rng",
+    action="store_true",
+    default=False,
+    help="Enable Secure RNG to have trustworthy privacy guarantees. Comes at a performance cost",
+)
+parser.add_argument(
     "-r",
     "--n-runs",
     type=int,
@@ -119,17 +127,13 @@ torch.manual_seed(opt.manualSeed)
 
 cudnn.benchmark = True
 
-if opt.data_root is None and str(opt.dataset).lower() != "fake":
-    raise ValueError(
-        '`data-root` parameter is \
-    required for dataset "%s"'
-        % opt.dataset
-    )
+if opt.data_root is None:
+    raise ValueError("`data-root` parameter is required.")
 
 try:
     dataset = dset.MNIST(
         root=opt.data_root,
-        download=False,
+        download=True,
         transform=transforms.Compose(
             [
                 transforms.Resize(opt.imageSize),
@@ -145,8 +149,15 @@ try:
 except ValueError:
     print("Cannot load dataset")
 
+generator = (
+    prng.create_random_device_generator("/dev/urandom") if opt.secure_rng else None
+)
 dataloader = torch.utils.data.DataLoader(
-    dataset, batch_size=opt.batch_size, shuffle=True, num_workers=int(opt.workers)
+    dataset,
+    batch_size=opt.batch_size,
+    shuffle=True,
+    num_workers=int(opt.workers),
+    generator=generator,
 )
 
 device = torch.device(opt.device)
@@ -256,8 +267,8 @@ if opt.netD != "":
 criterion = nn.BCELoss()
 
 FIXED_NOISE = torch.randn(opt.batch_size, nz, 1, 1, device=device)
-REAL_LABEL = 1
-FAKE_LABEL = 0
+REAL_LABEL = 1.0
+FAKE_LABEL = 0.0
 
 # setup optimizer
 optimizerD = optim.Adam(netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -272,17 +283,20 @@ privacy_engine = PrivacyEngine(
     alphas=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
     noise_multiplier=opt.sigma,
     max_grad_norm=opt.max_per_sample_grad_norm,
+    secure_rng=opt.secure_rng,
 )
 if not opt.disable_dp:
     privacy_engine.attach(optimizerD)
 optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 
 for epoch in range(opt.epochs):
-    for i, data in enumerate(dataloader, 0):
+    data_bar = tqdm(dataloader)
+    for i, data in enumerate(data_bar, 0):
         ############################
         # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
         ###########################
-        netD.zero_grad()
+
+        optimizerD.zero_grad()
 
         real_data = data[0].to(device)
         batch_size = real_data.size(0)
@@ -310,38 +324,17 @@ for epoch in range(opt.epochs):
         ############################
         # (2) Update G network: maximize log(D(G(z)))
         ###########################
-        netG.zero_grad()
+        optimizerG.zero_grad()
         label_g = torch.full((batch_size,), REAL_LABEL, device=device)
         output_g = netD(fake)
         errG = criterion(output_g, label_g)
         errG.backward()
         D_G_z2 = output.mean().item()
         optimizerG.step()
-        # When training the Generator, the gradients backpropagate through netD to netG
-        # The hook attached to netD then got triggerd
-        # which add grad_output to backpropagate lists in each layer in netD
-        # However the list is not cleared in optimizerG.step()
-        # thus we have to clear the backprop list in netD manually
-        # we will make this cleaner in the API in the near future,
-        # but for now this works and it is correct
-        # (even though it's slower than it should be because we generate
-        # per-sample gradients and then throw them away)
-        # pyre-fixme[16]: Module `autograd_grad_sample` has no attribute
-        #  `clear_backprops`.
-        autograd_grad_sample.clear_backprops(netD)
-        print(
-            "[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f"
-            % (
-                epoch,
-                opt.epochs,
-                i,
-                len(dataloader),
-                errD.item(),
-                errG.item(),
-                D_x,
-                D_G_z1,
-                D_G_z2,
-            )
+        data_bar.set_description(
+            f"epoch: {epoch}, Loss_D: {errD.item()} "
+            f"Loss_G: {errG.item()} D(x): {D_x} "
+            f"D(G(z)): {D_G_z1}/{D_G_z2}"
         )
 
         if not opt.disable_dp:

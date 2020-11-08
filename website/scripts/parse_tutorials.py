@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import argparse
 import json
@@ -59,7 +60,7 @@ def gen_tutorials(repo_dir: str) -> None:
         # displayname is absent from notebook metadata
         nb["metadata"]["kernelspec"]["display_name"] = "python3"
 
-        exporter = HTMLExporter()
+        exporter = HTMLExporter(template_name="classic")
         html, meta = exporter.from_notebook_node(nb)
 
         # pull out html div for notebook

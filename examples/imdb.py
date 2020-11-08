@@ -11,19 +11,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchtext
+import torchcsprng as prng
+from datasets import load_dataset
 from opacus import PrivacyEngine
 from torch.functional import F
-from torchtext.data.utils import get_tokenizer
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import BertTokenizerFast
 
 
 class SampleNet(nn.Module):
     def __init__(self, vocab_size: int):
         super().__init__()
-        # Embedding dimension: vocab_size + <unk>, <pad>, <eos>, <sos>
-        self.emb = nn.Embedding(vocab_size + 4, 16)
-        self.pool = nn.AvgPool1d(256)
+        self.emb = nn.Embedding(vocab_size, 16)
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc1 = nn.Linear(16, 16)
         self.fc2 = nn.Linear(16, 2)
 
@@ -34,7 +36,6 @@ class SampleNet(nn.Module):
         x = self.fc1(x)
         x = F.relu(x)
         x = self.fc2(x)
-
         return x
 
     def name(self):
@@ -47,15 +48,26 @@ def binary_accuracy(preds, y):
     return acc
 
 
+def padded_collate(batch, padding_idx=0):
+    x = pad_sequence(
+        [elem["input_ids"] for elem in batch],
+        batch_first=True,
+        padding_value=padding_idx,
+    )
+    y = torch.stack([elem["label"] for elem in batch]).long()
+    return x, y
+
+
 def train(args, model, train_loader, optimizer, epoch):
-    model.train()
     criterion = nn.CrossEntropyLoss()
     losses = []
     accuracies = []
+    device = torch.device(args.device)
+    model = model.train().to(device)
 
-    for batch in tqdm(train_loader):
-        data = batch.text.transpose(0, 1)
-        label = batch.label
+    for data, label in tqdm(train_loader):
+        data = data.to(device)
+        label = label.to(device)
 
         optimizer.zero_grad()
         predictions = model(data).squeeze(1)
@@ -83,15 +95,16 @@ def train(args, model, train_loader, optimizer, epoch):
 
 
 def evaluate(args, model, test_loader):
-    model.eval()
     criterion = nn.CrossEntropyLoss()
     losses = []
     accuracies = []
+    device = torch.device(args.device)
+    model = model.eval().to(device)
 
     with torch.no_grad():
-        for batch in tqdm(test_loader):
-            data = batch.text.transpose(0, 1)
-            label = batch.label
+        for data, label in tqdm(test_loader):
+            data = data.to(device)
+            label = label.to(device)
 
             predictions = model(data).squeeze(1)
 
@@ -156,18 +169,11 @@ def main():
         help="Target delta (default: 1e-5)",
     )
     parser.add_argument(
-        "--vocab-size",
-        type=int,
-        default=10_000,
-        metavar="MV",
-        help="Max vocab size (default: 10000)",
-    )
-    parser.add_argument(
-        "--sequence-length",
+        "--max-sequence-length",
         type=int,
         default=256,
         metavar="SL",
-        help="Longer sequences will be cut to this length, shorter sequences will be padded to this length (default: 256)",
+        help="Longer sequences will be cut to this length (default: 256)",
     )
     parser.add_argument(
         "--device",
@@ -188,50 +194,81 @@ def main():
         help="Disable privacy training and just train with vanilla optimizer",
     )
     parser.add_argument(
+        "--secure-rng",
+        action="store_true",
+        default=False,
+        help="Enable Secure RNG to have trustworthy privacy guarantees. Comes at a performance cost",
+    )
+    parser.add_argument(
         "--data-root", type=str, default="../imdb", help="Where IMDB is/will be stored"
+    )
+    parser.add_argument(
+        "-j",
+        "--workers",
+        default=2,
+        type=int,
+        metavar="N",
+        help="number of data loading workers (default: 2)",
     )
 
     args = parser.parse_args()
     device = torch.device(args.device)
 
-    text_field = torchtext.data.Field(
-        tokenize=get_tokenizer("basic_english"),
-        init_token="<sos>",
-        eos_token="<eos>",
-        fix_length=args.sequence_length,
-        lower=True,
+    raw_dataset = load_dataset("imdb", cache_dir="imdb")
+    tokenizer = BertTokenizerFast.from_pretrained("bert-base-cased")
+    dataset = raw_dataset.map(
+        lambda x: tokenizer(
+            x["text"], truncation=True, max_length=args.max_sequence_length
+        ),
+        batched=True,
+    )
+    dataset.set_format(type="torch", columns=["input_ids", "label"])
+
+    train_dataset = dataset["train"]
+    test_dataset = dataset["test"]
+
+    generator = (
+        prng.create_random_device_generator("/dev/urandom") if args.secure_rng else None
     )
 
-    label_field = torchtext.data.LabelField(dtype=torch.long)
-
-    train_data, test_data = torchtext.datasets.imdb.IMDB.splits(
-        text_field, label_field, root=args.data_root
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        drop_last=True,
+        generator=generator,
+        collate_fn=padded_collate,
+        pin_memory=True,
     )
 
-    text_field.build_vocab(train_data, max_size=args.vocab_size)
-    label_field.build_vocab(train_data)
-
-    (train_iterator, test_iterator) = torchtext.data.BucketIterator.splits(
-        (train_data, test_data), batch_size=args.batch_size, device=device
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        collate_fn=padded_collate,
+        pin_memory=True,
     )
 
-    model = SampleNet(vocab_size=args.vocab_size).to(device)
+    model = SampleNet(vocab_size=len(tokenizer)).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     if not args.disable_dp:
         privacy_engine = PrivacyEngine(
             model,
             batch_size=args.batch_size,
-            sample_size=len(train_data),
+            sample_size=len(train_dataset),
             alphas=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
             noise_multiplier=args.sigma,
             max_grad_norm=args.max_per_sample_grad_norm,
+            secure_rng=args.secure_rng,
         )
         privacy_engine.attach(optimizer)
 
     for epoch in range(1, args.epochs + 1):
-        train(args, model, train_iterator, optimizer, epoch)
-        evaluate(args, model, test_iterator)
+        train(args, model, train_loader, optimizer, epoch)
+        evaluate(args, model, test_loader)
 
 
 if __name__ == "__main__":

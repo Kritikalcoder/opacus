@@ -2,6 +2,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import warnings
+from copy import deepcopy
 from enum import IntEnum
 from typing import Any, Dict, Optional
 
@@ -21,13 +22,13 @@ class StatType(IntEnum):
     This enum covers all the stat types we currently support.
 
     1. LOSS: Monitors the training loss.
-    2. CLIPPING: Monitors clipping by logging the norm of the gradients across iterations
+    2. Grads: Monitors stats about the gradients across iterations
     3. PRIVACY: Logs Epsilon so you can see how it evolves during training
     4. TRAIN: This is a TB namespace where you can attach training metrics
     5. TEST: Similar to TRAIN, just another TB namespace to log things under
     """
     LOSS = 1
-    CLIPPING = 2
+    GRAD = 2
     PRIVACY = 3
     TRAIN = 4
     TEST = 5
@@ -44,31 +45,30 @@ class Stat:
 
     We have already implemented some common ones inside ``opacus.utils.stat.StatType``.
 
-    Internal Privacy metrics (such as ``StatType.PRIVACY`` and ``StatType.CLIPPING``)
+    Internal Privacy metrics (such as ``StatType.PRIVACY`` and ``StatType.GRAD``)
     are already added to the code and need only be activated by adding the stat
     as shown in the example. Other stat types need to be added to the stat
     and updated properly using ``update`` function.
 
-    Examples
-    --------
-    To get stats about clipping you can add the following line
-    to your main file. By default the samples are averaged and the average is
-    reported every ``1 / frequency`` times.
+    Examples:
+        To get stats about clipping you can add the following line
+        to your main file. By default the samples are averaged and the average is
+        reported every ``1 / frequency`` times.
 
-        >>> stat = Stat(StatType.CLIPPING, 'sample_stats', frequency=0.1)
+        >>> stat = Stat(StatType.GRAD, 'sample_stats', frequency=0.1)
         >>> for i in range(20):
         >>>    stat.log({"val":i})
 
-    If an instance of ``tensorboard.SummaryWriter`` exists it can be used
-    for stat gathering by passing it like this:
+        If an instance of ``tensorboard.SummaryWriter`` exists it can be used
+        for stat gathering by passing it like this:
 
         >>> stats.set_global_summary_writer(tensorboard.SummaryWriter())
 
-    To add stats about test accuracy you can do:
+        To add stats about test accuracy you can do:
 
         >>> stats.add(Stat(stats.StatType.TEST, 'accuracy', frequency=0.1))
 
-    and then update the stat meter in the proper location using:
+        and then update the stat meter in the proper location using:
 
         >>> acc1_value = compute_accuracy(x, y)  # you can supply your metrics functions, and Stats later displays them
         >>> stats.update(stats.StatType.TEST, acc1=acc1_value)  # pass to Stats the result so that the result gets logged
@@ -83,22 +83,17 @@ class Stat:
         reduction: str = "avg",
     ):
         r"""
-        Parameters
-        ----------
-        stat_type:
-            Type of the statistic from ``StatType``.
-        name:
-            Name of the stat that is used to identify this ``Stat``
-            for update or to view in tensorboard.
-        frequency:
-            The frequency of stat gathering. Its value is in [0, 1],
-            where e.g. 1 means report to tensorboard any time ``log`` is
-            called and 0.1 means report only 1 out of 10 times.
-        reduction:
-            The reduction strategy used for reporting, e.g. if
-            ``frequency = 0.1`` and ``reduction='avg'`` then ``log`` averages 10 samples
-            and reports to tensorboard this average once every 10 samples.
-            Current valid values are 'avg' and 'sample'.
+        Args:
+            stat_type: Type of the statistic from ``StatType``.
+            name: Name of the stat that is used to identify this ``Stat``
+                for update or to view in tensorboard.
+            frequency: The frequency of stat gathering. Its value is in [0, 1],
+                where e.g. 1 means report to tensorboard any time ``log`` is
+                called and 0.1 means report only 1 out of 10 times.
+            reduction: The reduction strategy used for reporting, e.g. if
+                ``frequency = 0.1`` and ``reduction='avg'`` then ``log`` averages
+                10 samples and reports to tensorboard this average once every 10
+                samples. Current valid values are 'avg' and 'sample'.
         """
         self.type = stat_type
         self.name = name
@@ -115,20 +110,21 @@ class Stat:
         self.named_value = {}
         self.iter = 0
 
-    def log(self, named_value: Dict[str, Any]):
+    def log(self, named_value: Dict[str, Any], hist: bool = False):
         r"""
         Logs a metrics to tensorboard.
 
         Generally not used directly (use ``update`` instead).
 
-        Parameters
-        ----------
-        named_value
-            A dictionary of metrics to log
+        Args:
+            named_value: A dictionary of metrics to log
         """
+        assert not (self.reduction == "avg" and hist)
         if self.iter % self.report == 0:
             for k, v in self.named_value.items():
-                self.writer.add_scalar(
+                self.writer.add_histogram(
+                    f"{self.type.name}:{self.name}/{k}", v, self.iter
+                ) if hist else self.writer.add_scalar(
                     f"{self.type.name}:{self.name}/{k}", v, self.iter
                 )
         self._aggregate(named_value)
@@ -141,7 +137,7 @@ class Stat:
             named_value: The value to aggregate
         """
         if self.reduction == "sample":
-            self.named_values = named_value
+            self.named_value = deepcopy(named_value)
         elif self.reduction == "avg":
             for k, v in named_value.items():
                 self.named_value[k] = (
@@ -173,10 +169,8 @@ def add(*args: Stat):
     r"""
     Adds statistics gathering to the process.
 
-    Parameters
-    ----------
-    *args:
-        An iterable of statistics to add
+    Args:
+        *args: An iterable of statistics to add
     """
     [Stats.append(stat) for stat in args]
 
@@ -192,10 +186,8 @@ def remove(name: str):
     r"""
     Removes the Stat of name ``name`` from the global statistics gathering.
 
-    Parameters
-    ----------
-    name:
-        The name of stats to remove
+    Args:
+        name: The name of stats to remove
     """
     global Stats
     Stats = [stat for stat in Stats if stat.name != name]
@@ -205,12 +197,9 @@ def reset(stat_type: Optional[StatType] = None, name: Optional[str] = None):
     r"""
     Resets the stat with given `name` and `stat_type`
 
-    Parameters
-    ----------
-    stat_type:
-        The stat_type to reset
-    name:
-        The name of stats to reset
+    Args:
+        stat_type: The stat_type to reset
+        name: The name of stats to reset
     """
     [
         stat.reset()
@@ -223,24 +212,21 @@ def reset(stat_type: Optional[StatType] = None, name: Optional[str] = None):
 def update(
     stat_type: Optional[StatType] = None,
     name: Optional[str] = None,
+    hist: bool = False,
     **named_values: str,
 ):
     r"""
     Updates the stat(s) with the given ``name`` and ``stat_type``
 
-    Parameters
-    ----------
-        stat_type:
-            The type of the stat from ``StatType``. Could be ``None``
-            if ``name`` is unique.
-        name:
-            The name of the stat. Could be ``None`` if there is only one
-            stat for the ``stat_type``
-        **named_values:
-            A set of values with their names
+    Args:
+        stat_type: The type of the stat from ``StatType``. Could be
+            ``None`` if ``name`` is unique.
+        name: The name of the stat. Could be ``None`` if there is only
+            one stat for the ``stat_type``
+        **named_values: A set of values with their names
     """
     [
-        stat.log(named_values)
+        stat.log(named_values, hist)
         for stat in Stats
         if (stat_type is None or stat.type == stat_type)
         and (name is None or stat.name == name)

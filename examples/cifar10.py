@@ -16,10 +16,12 @@ import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.utils.tensorboard as tensorboard
+import torchcsprng as prng
 import torchvision.models as models
 import torchvision.transforms as transforms
-from opacus import PrivacyEngine, utils
+from opacus import PrivacyEngine
 from opacus.utils import stats
+from opacus.utils.module_modification import convert_batchnorm_modules
 from torchvision.datasets import CIFAR10
 from tqdm import tqdm
 
@@ -30,21 +32,8 @@ def save_checkpoint(state, is_best, filename="checkpoint.tar"):
         shutil.copyfile(filename, "model_best.pth.tar")
 
 
-def topk_accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+def accuracy(preds, labels):
+    return (preds == labels).mean()
 
 
 def train(args, model, train_loader, optimizer, epoch, device):
@@ -53,7 +42,6 @@ def train(args, model, train_loader, optimizer, epoch, device):
 
     losses = []
     top1_acc = []
-    top5_acc = []
 
     for i, (images, target) in enumerate(tqdm(train_loader)):
 
@@ -63,14 +51,15 @@ def train(args, model, train_loader, optimizer, epoch, device):
         # compute output
         output = model(images)
         loss = criterion(output, target)
+        preds = np.argmax(output.detach().cpu().numpy(), axis=1)
+        labels = target.detach().cpu().numpy()
 
         # measure accuracy and record loss
-        acc1, acc5 = topk_accuracy(output, target, topk=(1, 5))
+        acc1 = accuracy(preds, labels)
 
         losses.append(loss.item())
-        top1_acc.append(acc1.item())
-        top5_acc.append(acc5.item())
-        stats.update(stats.StatType.TRAIN, acc1=acc1.item(), acc5=acc5.item())
+        top1_acc.append(acc1)
+        stats.update(stats.StatType.TRAIN, acc1=acc1)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -92,7 +81,6 @@ def train(args, model, train_loader, optimizer, epoch, device):
                     f"\tTrain Epoch: {epoch} \t"
                     f"Loss: {np.mean(losses):.6f} "
                     f"Acc@1: {np.mean(top1_acc):.6f} "
-                    f"Acc@5: {np.mean(top5_acc):.6f} "
                     f"(ε = {epsilon:.2f}, δ = {args.delta}) for α = {best_alpha}"
                 )
             else:
@@ -100,7 +88,6 @@ def train(args, model, train_loader, optimizer, epoch, device):
                     f"\tTrain Epoch: {epoch} \t"
                     f"Loss: {np.mean(losses):.6f} "
                     f"Acc@1: {np.mean(top1_acc):.6f} "
-                    f"Acc@5: {np.mean(top5_acc):.6f} "
                 )
 
 
@@ -109,7 +96,6 @@ def test(args, model, test_loader, device):
     criterion = nn.CrossEntropyLoss()
     losses = []
     top1_acc = []
-    top5_acc = []
 
     with torch.no_grad():
         for images, target in tqdm(test_loader):
@@ -118,22 +104,17 @@ def test(args, model, test_loader, device):
 
             output = model(images)
             loss = criterion(output, target)
-            acc1, acc5 = topk_accuracy(output, target, topk=(1, 5))
+            preds = np.argmax(output.detach().cpu().numpy(), axis=1)
+            labels = target.detach().cpu().numpy()
+            acc1 = accuracy(preds, labels)
 
             losses.append(loss.item())
-            top1_acc.append(acc1.item())
-            top5_acc.append(acc5.item())
+            top1_acc.append(acc1)
 
     top1_avg = np.mean(top1_acc)
-    top5_avg = np.mean(top5_acc)
-    stats.update(stats.StatType.TEST, acc1=top1_avg, acc5=top5_avg)
+    stats.update(stats.StatType.TEST, acc1=top1_avg)
 
-    print(
-        f"\tTest set:"
-        f"Loss: {np.mean(losses):.6f} "
-        f"Acc@1: {top1_avg :.6f} "
-        f"Acc@5: {top5_avg :.6f} "
-    )
+    print(f"\tTest set:" f"Loss: {np.mean(losses):.6f} " f"Acc@1: {top1_avg :.6f} ")
     return np.mean(top1_acc)
 
 
@@ -253,6 +234,12 @@ def main():
         help="Disable privacy training and just train with vanilla SGD",
     )
     parser.add_argument(
+        "--secure-rng",
+        action="store_true",
+        default=False,
+        help="Enable Secure RNG to have trustworthy privacy guarantees. Comes at a performance cost",
+    )
+    parser.add_argument(
         "--delta",
         type=float,
         default=1e-5,
@@ -292,11 +279,11 @@ def main():
     # 2. enable stats
     stats.add(
         # stats about gradient norms aggregated for all layers
-        stats.Stat(stats.StatType.CLIPPING, "AllLayers", frequency=0.1),
+        stats.Stat(stats.StatType.GRAD, "AllLayers", frequency=0.1),
         # stats about gradient norms per layer
-        stats.Stat(stats.StatType.CLIPPING, "PerLayer", frequency=0.1),
+        stats.Stat(stats.StatType.GRAD, "PerLayer", frequency=0.1),
         # stats about clipping
-        stats.Stat(stats.StatType.CLIPPING, "ClippingStats", frequency=0.1),
+        stats.Stat(stats.StatType.GRAD, "ClippingStats", frequency=0.1),
         # stats on training accuracy
         stats.Stat(stats.StatType.TRAIN, "accuracy", frequency=0.01),
         # stats on validation accuracy
@@ -306,6 +293,10 @@ def main():
     # The following lines enable stat gathering for the clipping process
     # and set a default of per layer clipping for the Privacy Engine
     clipping = {"clip_per_layer": False, "enable_stat": True}
+
+    generator = (
+        prng.create_random_device_generator("/dev/urandom") if args.secure_rng else None
+    )
     augmentations = [
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -330,6 +321,7 @@ def main():
         shuffle=True,
         num_workers=args.workers,
         drop_last=True,
+        generator=generator,
     )
 
     test_dataset = CIFAR10(
@@ -344,7 +336,7 @@ def main():
 
     best_acc1 = 0
     device = torch.device(args.device)
-    model = utils.convert_batchnorm_modules(models.resnet18(num_classes=10))
+    model = convert_batchnorm_modules(models.resnet18(num_classes=10))
     model = model.to(device)
 
     if args.optim == "SGD":
@@ -369,6 +361,7 @@ def main():
             alphas=[1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)),
             noise_multiplier=args.sigma,
             max_grad_norm=args.max_per_sample_grad_norm,
+            secure_rng=args.secure_rng,
             **clipping,
         )
         privacy_engine.attach(optimizer)

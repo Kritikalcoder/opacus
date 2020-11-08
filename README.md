@@ -1,14 +1,12 @@
-<p align="center"><img src="./website/static/img/opacus_logo.svg" alt="Opacus Logo" width="500"/></p>
+<p align="center"><img src="https://github.com/pytorch/opacus/blob/master/website/static/img/opacus_logo.svg" alt="Opacus" width="500"/></p>
 
 <hr/>
 
 [![CircleCI](https://circleci.com/gh/pytorch/opacus.svg?style=svg)](https://circleci.com/gh/pytorch/opacus)
 
-Opacus is a library that enables training PyTorch models with differential privacy. It supports training with minimal code changes required on the client, has little impact on training performance and allows the client to online track the privacy budget expended at any given moment.
+[Opacus](https://opacus.ai) is a library that enables training PyTorch models with differential privacy. It supports training with minimal code changes required on the client, has little impact on training performance and allows the client to online track the privacy budget expended at any given moment.
 
-*Opacus is currently in beta phase and under active development!*
-
-### Target audience
+## Target audience
 This code release is aimed at two target audiences:
 1. ML practitioners will find this to be a gentle introduction to training a model with differential privacy as it requires minimal code changes.
 2. Differential Privacy scientists will find this easy to experiment and tinker with, allowing them to focus on what matters.
@@ -20,6 +18,16 @@ The latest release of Opacus can be installed via `pip`:
 pip install opacus
 ```
 
+> :warning: **NOTE**: This will bring in the latest version of our deps, which are on Cuda 10.2. This will not work if you environment is using an older Cuda version (for example, Google Colab is still on Cuda 10.1).
+
+To install on Colab, run this cell first:
+
+```bash
+pip install torchcsprng==0.1.2+cu101 torch==1.6.0+cu101 torchvision==0.7.0+cu101 -f https://download.pytorch.org/whl/torch_stable.html
+```
+Then you can just `pip install opacus` like before. See more context in [this issue](https://github.com/pytorch/opacus/issues/69).
+
+
 You can also install directly from the source for the latest features (along with its quirks and potentially ocassional bugs):
 ```bash
 git clone https://github.com/pytorch/opacus.git
@@ -28,7 +36,7 @@ pip install -e .
 ```
 
 ## Getting started
-To train your model with differential privacy, all you need to do is to declare a PrivacyEngine and attach it to your optimizer before running, eg:
+To train your model with differential privacy, all you need to do is to declare a `PrivacyEngine` and attach it to your optimizer before running, eg:
 
 ```python
 model = Net()
@@ -37,7 +45,7 @@ privacy_engine = PrivacyEngine(
     model,
     batch_size,
     sample_size,
-    alphas=[1, 10, 100],
+    alphas=[10, 100],
     noise_multiplier=1.3,
     max_grad_norm=1.0,
 )
@@ -45,13 +53,13 @@ privacy_engine.attach(optimizer)
 # Now it's business as usual
 ```
 
-The [MNIST example](examples/mnist.py) shows an end-to-end run using opacus. The [examples](examples/) folder contains more such examples.
+The [MNIST example](https://github.com/pytorch/opacus/tree/master/examples/mnist.py) shows an end-to-end run using opacus. The [examples](https://github.com/pytorch/opacus/tree/master/examples/) folder contains more such examples.
 
 ## FAQ
-Checkout the [FAQ](docs/faq.md) page for answers to some of the most frequently asked questions about Differential Privacy and Opacus.
+Checkout the [FAQ](https://opacus.ai/docs/faq) page for answers to some of the most frequently asked questions about Differential Privacy and Opacus.
 
 ## Contributing
-See the [CONTRIBUTING](CONTRIBUTING.md) file for how to help out.
+See the [CONTRIBUTING](https://github.com/pytorch/opacus/tree/master/CONTRIBUTING.md) file for how to help out.
 
 ## References
 * [Mironov, Ilya. "Rényi differential privacy." 2017 IEEE 30th Computer Security Foundations Symposium (CSF). IEEE, 2017.](https://arxiv.org/abs/1702.07476)
@@ -61,4 +69,4 @@ See the [CONTRIBUTING](CONTRIBUTING.md) file for how to help out.
 * [McMahan, H. Brendan, and Galen Andrew. "A general approach to adding differential privacy to iterative training procedures." arXiv preprint arXiv:1812.06210 (2018).](https://arxiv.org/abs/1812.06210)
 
 ## License
-This code is released under Apache 2.0, as found in the [LICENSE](LICENSE) file.
+This code is released under Apache 2.0, as found in the [LICENSE](https://github.com/pytorch/opacus/tree/master/LICENSE) file.
